@@ -21,12 +21,15 @@ from pypdf import PdfReader
 # --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
-# "gemini-flash-latest" always points to the newest Flash model. You can pin a
-# specific one (e.g. "gemini-2.5-flash") via the GEMINI_MODEL secret / env var.
-DEFAULT_MODEL = "gemini-flash-latest"
-# Tried in order if the main model is overloaded (503) or unavailable (404).
-FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
-RETRIES_PER_MODEL = 3        # attempts per model before moving to the next one
+# Google retires / renames Flash models often, so the app does not rely on one name:
+#   1) GEMINI_MODEL (secret / env var) if you set it, else DEFAULT_MODEL
+#   2) the FALLBACK_MODELS below
+#   3) any other Flash model your API key can actually use (looked up live)
+APP_VERSION = "v3 (model fallback + discovery)"
+DEFAULT_MODEL = "gemini-3.8-flash"
+FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-flash-latest"]
+MAX_DISCOVERED_MODELS = 3    # cap on extra models taken from the live model list
+RETRIES_PER_MODEL = 3        # attempts per model on 503/429 before moving on
 BACKOFF_SECONDS = 2          # waits 2s, 4s, ... between attempts
 MAX_FILE_MB = 5
 MAX_RESUME_CHARS = 20_000
@@ -273,17 +276,59 @@ def _is_transient(exc):
                                   "resource_exhausted", "deadline", "timed out"))
 
 
+def discover_flash_models(client):
+    """Ask the API which stable Flash text models this key can use (newest first)."""
+    found = []
+    try:
+        for m in client.models.list():
+            name = (getattr(m, "name", "") or "").replace("models/", "")
+            actions = getattr(m, "supported_actions", None) or []
+            if actions and "generateContent" not in actions:
+                continue
+            # stable names only: gemini-3.8-flash, gemini-3.5-flash-lite (no previews/tts/image)
+            if re.fullmatch(r"gemini-\d+(?:\.\d+)?-flash(?:-lite)?", name):
+                found.append(name)
+    except Exception:
+        return []
+
+    def sort_key(n):
+        version = float(re.search(r"gemini-(\d+(?:\.\d+)?)", n).group(1))
+        return (-version, "lite" in n)
+
+    return sorted(set(found), key=sort_key)
+
+
+def _candidate_models(client, primary):
+    """Yield models to try: primary, static fallbacks, then live-discovered ones."""
+    seen = set()
+    for m in [primary] + FALLBACK_MODELS:
+        if m and m not in seen:
+            seen.add(m)
+            yield m
+    extra = 0
+    for m in discover_flash_models(client):
+        if m not in seen and extra < MAX_DISCOVERED_MODELS:
+            seen.add(m)
+            extra += 1
+            yield m
+
+
 def _call_model(client, model, prompt):
+    # No temperature/top_p: newer Gemini models ignore or reject sampling parameters.
     response = client.models.generate_content(
         model=model,
         contents=prompt,
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_INSTRUCTION,
             response_mime_type="application/json",
-            temperature=0.2,
         ),
     )
     return parse_ai_json(response.text)
+
+
+def _short(exc):
+    msg = str(exc).replace("\n", " ")
+    return f"{_error_code(exc) or type(exc).__name__}: {msg[:110]}"
 
 
 def analyze_with_gemini(api_key, model, resume_text, job_description,
@@ -291,20 +336,19 @@ def analyze_with_gemini(api_key, model, resume_text, job_description,
     """Call Gemini with retries + model fallback. Returns (result, model_used)."""
     client = genai.Client(api_key=api_key)
     prompt = build_prompt(resume_text, job_description)
-    models = [model] + [m for m in FALLBACK_MODELS if m != model]
-    last_error = None
+    failures = []                      # [(model, short error, was_404)]
 
-    for m in models:
+    for m in _candidate_models(client, model):
         for attempt in range(1, RETRIES_PER_MODEL + 1):
             try:
                 return _call_model(client, m, prompt), m
             except ValueError as e:          # bad / empty JSON: just try again
-                last_error = e
+                last = (m, _short(e), False)
             except Exception as e:
-                last_error = e
+                last = (m, _short(e), _error_code(e) == 404)
                 if _error_code(e) in (401, 403) or "api key" in str(e).lower():
                     raise                    # bad key: retrying will not help
-                if _error_code(e) == 404:
+                if last[2]:
                     break                    # model not available: next model
                 if not _is_transient(e):
                     raise
@@ -312,10 +356,17 @@ def analyze_with_gemini(api_key, model, resume_text, job_description,
                 if on_retry:
                     on_retry(m, attempt)
                 sleep(BACKOFF_SECONDS * 2 ** (attempt - 1))
+        failures.append(last)
+
+    tried = "; ".join(f"{m} ({err})" for m, err, _ in failures)
+    if failures and all(f[2] for f in failures):
+        raise RuntimeError(
+            "None of the tried Gemini models are available to your API key. "
+            "Set GEMINI_MODEL in your secrets to a model listed at "
+            "https://ai.google.dev/gemini-api/docs/models . Tried: " + tried)
     raise RuntimeError(
         "Gemini is overloaded or unavailable right now. Please wait a minute and try "
-        f"again. (Last error: {last_error})"
-    )
+        "again. Tried: " + tried)
 
 
 def final_score(ai_score, rule_score):
@@ -424,6 +475,7 @@ def main():
         else:
             st.success("API key loaded from secrets.")
         st.caption(f"Model: `{model}`")
+        st.caption(f"App version: {APP_VERSION}")
         st.markdown("Your resume is sent to Google's Gemini API for analysis and is "
                     "not stored by this app.")
 
