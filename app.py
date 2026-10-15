@@ -10,6 +10,7 @@ import io
 import json
 import os
 import re
+import time
 
 import streamlit as st
 from docx import Document
@@ -23,6 +24,10 @@ from pypdf import PdfReader
 # "gemini-flash-latest" always points to the newest Flash model. You can pin a
 # specific one (e.g. "gemini-2.5-flash") via the GEMINI_MODEL secret / env var.
 DEFAULT_MODEL = "gemini-flash-latest"
+# Tried in order if the main model is overloaded (503) or unavailable (404).
+FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
+RETRIES_PER_MODEL = 3        # attempts per model before moving to the next one
+BACKOFF_SECONDS = 2          # waits 2s, 4s, ... between attempts
 MAX_FILE_MB = 5
 MAX_RESUME_CHARS = 20_000
 MAX_JD_CHARS = 8_000
@@ -254,11 +259,24 @@ def parse_ai_json(raw):
     }
 
 
-def analyze_with_gemini(api_key, model, resume_text, job_description):
-    client = genai.Client(api_key=api_key)
+def _error_code(exc):
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    return code if isinstance(code, int) else None
+
+
+def _is_transient(exc):
+    """Overload / rate-limit / server errors that are worth retrying."""
+    if _error_code(exc) in (429, 500, 502, 503, 504):
+        return True
+    msg = str(exc).lower()
+    return any(k in msg for k in ("unavailable", "overloaded", "high demand",
+                                  "resource_exhausted", "deadline", "timed out"))
+
+
+def _call_model(client, model, prompt):
     response = client.models.generate_content(
         model=model,
-        contents=build_prompt(resume_text, job_description),
+        contents=prompt,
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_INSTRUCTION,
             response_mime_type="application/json",
@@ -266,6 +284,38 @@ def analyze_with_gemini(api_key, model, resume_text, job_description):
         ),
     )
     return parse_ai_json(response.text)
+
+
+def analyze_with_gemini(api_key, model, resume_text, job_description,
+                        sleep=time.sleep, on_retry=None):
+    """Call Gemini with retries + model fallback. Returns (result, model_used)."""
+    client = genai.Client(api_key=api_key)
+    prompt = build_prompt(resume_text, job_description)
+    models = [model] + [m for m in FALLBACK_MODELS if m != model]
+    last_error = None
+
+    for m in models:
+        for attempt in range(1, RETRIES_PER_MODEL + 1):
+            try:
+                return _call_model(client, m, prompt), m
+            except ValueError as e:          # bad / empty JSON: just try again
+                last_error = e
+            except Exception as e:
+                last_error = e
+                if _error_code(e) in (401, 403) or "api key" in str(e).lower():
+                    raise                    # bad key: retrying will not help
+                if _error_code(e) == 404:
+                    break                    # model not available: next model
+                if not _is_transient(e):
+                    raise
+            if attempt < RETRIES_PER_MODEL:
+                if on_retry:
+                    on_retry(m, attempt)
+                sleep(BACKOFF_SECONDS * 2 ** (attempt - 1))
+    raise RuntimeError(
+        "Gemini is overloaded or unavailable right now. Please wait a minute and try "
+        f"again. (Last error: {last_error})"
+    )
 
 
 def final_score(ai_score, rule_score):
@@ -403,15 +453,21 @@ def main():
             return
 
         rule_score, checks = rule_based_checks(text)
+        status = st.empty()
         try:
             with st.spinner("Analyzing with Gemini..."):
-                result = analyze_with_gemini(api_key, model, text, job_description)
-        except ValueError as e:
-            st.error(f"{e} Please try again.")
-            return
+                result, used_model = analyze_with_gemini(
+                    api_key, model, text, job_description,
+                    on_retry=lambda m, n: status.caption(
+                        f"Gemini is busy ({m}), retrying... (attempt {n + 1})"),
+                )
         except Exception as e:
+            status.empty()
             st.error(f"Gemini request failed: {e}")
             return
+        status.empty()
+        if used_model != model:
+            st.warning(f"The main model was busy, so `{used_model}` was used instead.")
         render_results(result, rule_score, checks)
 
 
